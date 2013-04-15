@@ -4,6 +4,7 @@ use DBIx::Handler;
 use DBIx::Sunny;
 use Plack::Builder;
 use Plack::Session;
+use Session::Token;
 use URI;
 use URI::Escape;
 use Furl;
@@ -14,12 +15,12 @@ use Config::Pit;
 my $config = pit_get('facebook.app', require => {
   app_id           => 'app_id',
   app_secret       => 'app_secret',
-  app_url          => 'app_url',
-  app_callback_url => 'app_callback_url'
+  app_callback_url => 'app_callback_url',
 });
 
 $config = {
   %$config,
+  token_key  => 'state',
   dialog_url => 'https://www.facebook.com/dialog/oauth',
   oauth_url  => 'https://graph.facebook.com/oauth/access_token',
   api_url    => 'https://graph.facebook.com/',
@@ -48,13 +49,28 @@ sub get_user {
 sub create_user {
   my ($id, $name, $icon) = @_;
   unless (get_user($id)) {
-    $handler->dbh->query(q{INSERT INTO user (id, name, icon) VALUES (?, ?, ?) }, $id, $name, $icon);
+    $handler->dbh->query(q{INSERT INTO user (id, name, icon) VALUES (?, ?, ?)}, $id, $name, $icon);
   }
 }
 
 my $ses;
 sub ses {
-    $ses ||= Plack::Session->new(req->env);
+  $ses ||= Plack::Session->new(req->env);
+}
+
+my $generator;
+sub get_token {
+  my ($key) = @_;
+  $generator ||= Session::Token->new();
+  my $token = $generator->get;
+  ses->set($key, $token);
+  return $token;
+}
+
+sub check_token {
+  my ($key, $token) = @_;
+  my $_token = ses->remove($key);
+  ($_token eq $token) ? 1 : 0;
 }
 
 get '/' => sub {
@@ -62,7 +78,11 @@ get '/' => sub {
   if (my $id = ses->get('access_token')) {
     $user = get_user($id);
   }
-  tmpl 'index.tx', { config => $config, user => $user };
+  tmpl 'index.tx', {
+    config => $config,
+    user   => $user,
+    state  => get_token($config->{token_key}),
+  };
 };
 
 post '/logout' => sub {
@@ -73,6 +93,8 @@ post '/logout' => sub {
 get '/callback' => sub {
   my $furl = Furl->new();
 
+  return r500 'token error' unless (check_token($config->{token_key}, param_raw->get('state')));
+
   my $uri = URI->new($config->{oauth_url});
   $uri->query_form(
     'client_id'     => $config->{app_id},
@@ -82,6 +104,8 @@ get '/callback' => sub {
   );
   my $res = $furl->get($uri);
 
+  return r500 $res->status_line unless ($res->is_success);
+
   my $param = { URI->new('?'.$res->content)->query_form };
 
   $uri = URI->new($config->{api_url}.'me');
@@ -90,6 +114,8 @@ get '/callback' => sub {
     access_token => $param->{access_token},
   );
   $res = $furl->get($uri);
+
+  return r500 $res->status_line unless ($res->is_success);
 
   my $json = decode_json $res->content;
   create_user($json->{id}, $json->{name}, $json->{picture}->{data}->{url});
@@ -114,7 +140,7 @@ __DATA__
     <form method="GET" action="<: $config.dialog_url :>">
       <input type="hidden" name="client_id" value="<: $config.app_id :>" />
       <input type="hidden" name="redirect_uri" value="<: $config.app_callback_url :>" />
-      <input type="hidden" name="state" value="1" />
+      <input type="hidden" name="state" value="<: $state :>" />
       <input type="submit" value="login" />
     </form>
   : } else {
